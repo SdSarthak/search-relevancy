@@ -1,0 +1,5 @@
+# Optional approximate nearest neighbour backend.
+# Needs a C++ toolchain when no wheel is published for your platform
+# (on Windows: "Microsoft C++ Build Tools").
+# Once installed, INDEX_BACKEND=auto picks it up automatically.
+annoy>=1.17,<2

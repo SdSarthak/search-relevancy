@@ -1,10 +1,14 @@
-pandas==1.5.3
-numpy==1.24.3
-spacy==3.5.0
-sentence-transformers==2.2.2
-annoy==1.17.3
-flask==2.3.2
-flask-cors==4.0.0
-boto3==1.28.0
-python-dotenv==1.0.0
-werkzeug==2.3.6
+# Core runtime dependencies.
+# ANNOY is deliberately NOT here: it is a C++ extension without prebuilt
+# wheels on several platforms, and the project ships an exact numpy index that
+# works everywhere. Install the optional accelerator with
+#   pip install -r requirements-annoy.txt
+numpy>=1.24,<3
+pandas>=1.5,<3
+spacy>=3.5,<4
+sentence-transformers>=2.2,<4
+flask>=2.3,<4
+flask-cors>=4.0,<7
+werkzeug>=2.3,<4
+python-dotenv>=1.0,<2
+gunicorn>=21.2,<24; sys_platform != "win32"
