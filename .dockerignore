@@ -8,6 +8,7 @@ venv/
 .venv
 .git
 .gitignore
+.github
 .env
 .DS_Store
 *.egg-info
@@ -16,3 +17,23 @@ build
 .pytest_cache
 .coverage
 htmlcov
+.mypy_cache
+.ruff_cache
+.idea
+.vscode
+
+# Artefacts and data are bind-mounted at runtime, never baked into the image.
+data/
+models/
+*.csv
+*.npy
+*.npz
+*.pkl
+*.annoy
+
+# Not needed inside the image
+tests/
+scripts/
+*.md
+run_pipeline.sh
+run_pipeline.bat

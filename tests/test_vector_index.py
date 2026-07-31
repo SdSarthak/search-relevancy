@@ -141,3 +141,47 @@ class TestBackendSelection:
     def test_load_index_reports_missing_files(self, tmp_path):
         with pytest.raises(FileNotFoundError, match="no index found"):
             load_index(tmp_path / "missing.annoy", dim=8, backend="auto")
+
+
+@pytest.mark.skipif(not annoy_available(), reason="annoy is not installed")
+class TestAnnoyBackend:
+    """Only runs where the optional C++ extension could be installed."""
+
+    def test_finds_the_query_vector_itself(self, embeddings):
+        index = create_index(dim=embeddings.shape[1], backend="annoy", num_trees=20)
+        index.add_items(embeddings)
+        index.build()
+        indices, scores = index.query(embeddings[2], k=3)
+        assert indices[0] == 2
+        assert scores[0] == pytest.approx(1.0, abs=1e-4)
+
+    def test_scores_match_the_exact_backend(self, embeddings, exact_index):
+        index = create_index(dim=embeddings.shape[1], backend="annoy", num_trees=50)
+        index.add_items(embeddings)
+        index.build()
+        approx_ids, approx_scores = index.query(embeddings[0], k=3)
+        exact_ids, exact_scores = exact_index.query(embeddings[0], k=3)
+        assert approx_ids == exact_ids
+        for approx, exact in zip(approx_scores, exact_scores):
+            assert approx == pytest.approx(exact, abs=1e-4)
+
+    def test_save_and_load_roundtrip(self, embeddings, tmp_path):
+        index = create_index(dim=embeddings.shape[1], backend="annoy")
+        index.add_items(embeddings)
+        saved_to = index.save(tmp_path / "articles_index.annoy")
+        assert saved_to.suffix == ".annoy"
+
+        reloaded = load_index(
+            tmp_path / "articles_index.annoy",
+            dim=embeddings.shape[1],
+            backend="annoy",
+        )
+        assert len(reloaded) == len(embeddings)
+        assert reloaded.query(embeddings[1], k=2)[0] == index.query(embeddings[1], k=2)[0]
+
+    def test_adding_after_build_raises(self, embeddings):
+        index = create_index(dim=embeddings.shape[1], backend="annoy")
+        index.add_items(embeddings)
+        index.build()
+        with pytest.raises(RuntimeError, match="already built"):
+            index.add_items(embeddings)
