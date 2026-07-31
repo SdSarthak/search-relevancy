@@ -1,504 +1,288 @@
-# Search Relevancy - News Article Search Engine
+# Search Relevancy
 
-A semantic search engine for news articles using Sentence-BERT (SBERT) embeddings and ANNOY approximate nearest neighbor indexing. The system is containerized with Docker and designed for deployment on AWS EC2 instances.
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Architecture](#architecture)
-- [Tech Stack](#tech-stack)
-- [Project Structure](#project-structure)
-- [Setup Instructions](#setup-instructions)
-- [Usage](#usage)
-- [API Endpoints](#api-endpoints)
-- [Docker Deployment](#docker-deployment)
-- [AWS EC2 Deployment](#aws-ec2-deployment)
-
-## Overview
-
-This project implements a semantic search system for news articles that:
-
-1. **Preprocesses** news article data (tokenization, lemmatization, stop word removal)
-2. **Generates embeddings** using Sentence-BERT (SBERT) model for semantic representation
-3. **Creates an index** using ANNOY for fast approximate nearest neighbor search
-4. **Serves queries** through a Flask REST API with cosine similarity scoring
-
-## Architecture
-
-The system follows a three-phase architecture:
-
-### Training Phase
-```
-Raw Data → Data Preprocessing → SBERT Embeddings → ANNOY Index
-```
-
-### Inference Phase
-```
-User Query → SBERT Encoding → ANNOY Search → Flask API → Results
-```
-
-### Deployment
-```
-Docker Container → AWS EC2 Instance → User Interface
-```
-
-## Tech Stack
-
-- **Language**: Python 3.10
-- **ML Models**: 
-  - Sentence-BERT (all-MiniLM-L6-v2)
-  - spaCy (NLP preprocessing)
-- **Indexing**: ANNOY (Approximate Nearest Neighbors)
-- **API Framework**: Flask with CORS
-- **Containerization**: Docker & Docker Compose
-- **Cloud**: AWS EC2
-- **Data Processing**: pandas, numpy
-
-## Project Structure
+Semantic search over a news corpus. Articles are cleaned with spaCy, embedded
+with Sentence-BERT, indexed for nearest-neighbour retrieval and served through
+a small Flask API — plus an evaluation harness that actually measures whether
+the ranking is any good.
 
 ```
-Search relevancy/
-├── src/
-│   ├── __init__.py
-│   ├── app.py                    # Flask API application
-│   ├── data_preprocessing.py      # Data preprocessing pipeline
-│   ├── sbert_embeddings.py       # SBERT embedding generation
-│   └── build_annoy_index.py      # ANNOY index building
-├── config/
-│   └── config.py                 # Configuration settings
-├── data/
-│   ├── raw/                      # Raw news articles CSV
-│   └── processed/                # Processed articles
-├── models/
-│   ├── embeddings.npy            # SBERT embeddings
-│   ├── metadata.pkl              # Article metadata
-│   └── articles_index.annoy      # ANNOY index
-├── Dockerfile                    # Docker image definition
-├── docker-compose.yml            # Docker Compose orchestration
-├── requirements.txt              # Python dependencies
-├── .dockerignore                 # Docker ignore patterns
-├── .gitignore                    # Git ignore patterns
-└── README.md                     # This file
+                     build time                          query time
+ raw CSV ──► preprocess ──► SBERT embed ──► index    query ──► SBERT ──► index ──► ranked hits
+             (spaCy)        (384-dim)      (annoy                                  (+ metadata)
+                                           or exact)
 ```
 
-## Setup Instructions
+## What is here
 
-### Prerequisites
+| Path | Purpose |
+|---|---|
+| `src/data_preprocessing.py` | Clean, lemmatise and de-noise raw articles |
+| `src/sbert_embeddings.py` | Encode articles, write `embeddings.npy` + `metadata.pkl` |
+| `src/vector_index.py` | Two interchangeable index backends (`annoy`, `exact`) |
+| `src/build_annoy_index.py` | Pipeline step that builds and saves the index |
+| `src/search_engine.py` | Encoder + index + metadata, framework-agnostic |
+| `src/app.py` | Flask REST API (`create_app()` WSGI factory) |
+| `src/search_cli.py` | Query the index from a terminal, no server needed |
+| `src/evaluate.py` | Precision/Recall/MRR/nDCG and ANN-vs-exact recall |
+| `config/config.py` | Every setting, overridable by environment variable |
+| `tests/` | Offline pytest suite (no network, no model download) |
+| `scripts/smoke_test_api.py` | Smoke test against a *running* API |
 
-- Python 3.10+
-- Docker & Docker Compose (for containerization)
-- AWS account with EC2 access (for cloud deployment)
-- At least 4GB RAM (for SBERT model loading)
+## Index backends
 
-### Local Development Setup
+The project ships two backends behind one interface, both returning cosine
+similarities in `[-1, 1]`:
 
-1. **Clone the repository**
-   ```bash
-   cd "c:\Users\sarth\OneDrive\Desktop\Projects\Search relevancy"
-   ```
+| Backend | Install | Results | Use when |
+|---|---|---|---|
+| `exact` | included | exact | default; fine up to a few hundred thousand articles |
+| `annoy` | `pip install -r requirements-annoy.txt` | approximate | large corpora, memory-mapped index |
 
-2. **Create virtual environment (optional but recommended)**
-   ```bash
-   python -m venv venv
-   # On Windows
-   venv\Scripts\activate
-   # On Linux/Mac
-   source venv/bin/activate
-   ```
+`INDEX_BACKEND=auto` (the default) picks ANNOY when it is importable and falls
+back to `exact` otherwise. ANNOY is a C++ extension without a wheel for every
+platform — on Windows it needs the Microsoft C++ Build Tools — which is why it
+is optional rather than a hard requirement.
 
-3. **Install dependencies**
-   ```bash
-   pip install -r requirements.txt
-   python -m spacy download en_core_web_sm
-   ```
+Each backend writes its own file next to the configured index path:
+`articles_index.annoy` or `articles_index.npz`.
 
-4. **Prepare data**
-   - Place your CSV file at `data/raw/news_articles.csv`
-   - Required columns: `article_id`, `category`, `subcategory`, `title`, `published_date`, `text`, `source`
+## Setup
 
-5. **Run preprocessing pipeline**
-   ```bash
-   python src/data_preprocessing.py
-   ```
-
-6. **Generate SBERT embeddings**
-   ```bash
-   python src/sbert_embeddings.py
-   ```
-
-7. **Build ANNOY index**
-   ```bash
-   python src/build_annoy_index.py
-   ```
-
-8. **Start Flask API**
-   ```bash
-   python src/app.py
-   ```
-
-The API will be available at `http://localhost:5000`
-
-## Usage
-
-### Quick Start with Docker Compose
+Requires Python 3.10+ and roughly 2 GB of RAM for the default MiniLM model.
 
 ```bash
-# Build and start the container
-docker-compose up --build
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 
-# The API will be available at http://localhost:5000
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+
+# optional: approximate index backend
+pip install -r requirements-annoy.txt
+
+cp .env.example .env            # optional; the defaults work as-is
 ```
 
-### Data Format
+## Getting data
 
-The raw CSV file should have the following structure:
+No news corpus is bundled — the usual news datasets cannot be redistributed
+here, and `data/` is gitignored.
+
+**Synthetic corpus (works immediately).** Generates a topically-structured
+fake corpus so the whole pipeline can be run and evaluated:
+
+```bash
+python generate_sample_data.py --num-articles 500
+```
+
+**Your own corpus.** Drop a CSV at `data/raw/news_articles.csv` with at least
+`title` and `text`. `article_id`, `category`, `subcategory`, `published_date`
+and `source` are used when present and backfilled when absent.
 
 ```csv
 article_id,category,subcategory,title,published_date,text,source
-1,World,Politics,Article Title,2023-01-15,"Full article text here...",BBC
-2,Technology,AI,"Another Article",2023-01-16,"Article content...",TechCrunch
+1,World,Politics,Article title,2023-01-15,"Full article text...",BBC
 ```
 
-## API Endpoints
+Public corpora that fit this shape include the MIND news recommendation
+dataset, the BBC News classification dataset and AG News; export them to the
+columns above. Set `RAW_DATA_PATH` if you keep the file elsewhere.
 
-### 1. Health Check
-```http
-GET /health
+## Running the pipeline
+
+Either run the four steps, or use the wrapper:
+
+```bash
+./run_pipeline.sh          # Windows: run_pipeline.bat
+./run_pipeline.sh --serve  # ... and start the API afterwards
 ```
 
-Response:
+```bash
+python -m src.data_preprocessing     # data/raw -> data/processed
+python -m src.sbert_embeddings       # -> models/embeddings.npy, models/metadata.pkl
+python -m src.build_annoy_index      # -> models/articles_index.{annoy,npz}
+python -m src.evaluate               # relevancy report
+```
+
+Every step takes `--help` and accepts explicit paths, so intermediate
+artefacts can live anywhere.
+
+## Querying
+
+From the terminal:
+
+```bash
+python -m src.search_cli "ocean temperatures and glaciers" -n 5
+python -m src.search_cli                 # interactive prompt
+```
+
+Or start the API:
+
+```bash
+python -m src.app                                            # dev server
+gunicorn -w 2 -b 0.0.0.0:5000 "src.app:create_app()"         # production
+```
+
+## API
+
+### `GET /health`
+
+`200` once the index and model are loaded, `503` with the reason otherwise —
+so it works as a container or load-balancer health check.
+
+```json
+{ "status": "healthy", "service": "Search Relevancy API", "num_articles": 500 }
+```
+
+### `POST /search`
+
+```json
+{ "query": "climate change", "num_results": 10 }
+```
+
 ```json
 {
-  "status": "healthy",
-  "service": "Search Relevancy API",
-  "num_articles": 22399
-}
-```
-
-### 2. Search Articles
-```http
-POST /search
-Content-Type: application/json
-
-{
   "query": "climate change",
-  "num_results": 10
-}
-```
-
-Response:
-```json
-{
-  "query": "climate change",
-  "num_results": 2,
+  "num_results": 1,
   "results": [
     {
-      "article_id": "123",
-      "title": "Global Climate Summit",
-      "category": "Environment",
-      "subcategory": "Climate",
-      "source": "Reuters",
-      "published_date": "2023-01-15",
-      "text": "Full article text...",
-      "relevance_score": 0.95
-    },
-    {
-      "article_id": "456",
-      "title": "Carbon Emissions Report",
+      "article_id": "article_00001",
+      "title": "Climate: ocean temperatures reach new high",
       "category": "Science",
       "subcategory": "Environment",
-      "source": "Nature",
-      "published_date": "2023-01-14",
-      "text": "Article text...",
-      "relevance_score": 0.92
+      "source": "Reuters",
+      "published_date": "2024-05-05",
+      "text": "Ocean temperatures reach new high. Researchers report...",
+      "relevance_score": 0.5699
     }
   ]
 }
 ```
 
-### 3. Batch Search
-```http
-POST /search/batch
-Content-Type: application/json
+`relevance_score` is the cosine similarity between the query and article
+embeddings: `1.0` identical, `0.0` unrelated, negative opposed. `text` is
+truncated to `SNIPPET_CHARS` characters.
 
-{
-  "queries": ["climate change", "renewable energy"],
-  "num_results": 5
-}
-```
+### `POST /search/batch`
 
-### 4. Service Information
-```http
-GET /info
-```
-
-Response:
 ```json
-{
-  "service": "Search Relevancy API",
-  "num_articles": 22399,
-  "embedding_model": "all-MiniLM-L6-v2",
-  "embedding_dimension": 384,
-  "default_results": 10,
-  "max_results": 50
-}
+{ "queries": ["climate change", "renewable energy"], "num_results": 5 }
 ```
 
-## Docker Deployment
+Up to 25 queries per request; responses come back under `batch_results`.
 
-### Build Docker Image
+### `GET /info`
+
+Article count, embedding model, embedding dimension and the active index
+backend.
+
+Errors are always JSON: `400` for a malformed request, `404` for an unknown
+route, `405` for the wrong method, `503` when the index has not loaded, `500`
+otherwise.
+
+## Measuring relevancy
+
+`src/evaluate.py` answers two separate questions.
+
+**Is the ranking good?** Precision@k, Recall@k, MRR and nDCG@k against a
+labelled query set. Supply your own:
+
+```json
+[{ "query": "climate change", "relevant_ids": ["article_00001"] }]
+```
 
 ```bash
-# Build the image
-docker build -t search-relevancy:latest .
-
-# Run the container
-docker run -p 5000:5000 \
-  -v $(pwd)/models:/app/models \
-  -v $(pwd)/data:/app/data \
-  search-relevancy:latest
+python -m src.evaluate --queries my_queries.json --k 1 5 10
 ```
 
-### Using Docker Compose
+Without one, the harness derives a *known-item* set: each article's title
+becomes a query whose only relevant document is that article. It is a proxy,
+not a substitute for human judgements, but it is reproducible and free.
+
+**What does approximation cost?** The overlap between the live index's top-k
+and exact brute-force top-k, alongside both latencies — the recall traded for
+speed. With `INDEX_BACKEND=exact` the overlap is 1.0 by construction, which
+makes it a useful regression guard either way.
+
+```
+$ python -m src.evaluate --sample-size 60
+Search relevancy report
+========================================
+queries evaluated : 60
+MRR               : 0.6311
+  P@1    0.3833   R@1    0.3833   nDCG@1    0.3833
+  P@5    0.2000   R@5    1.0000   nDCG@5    0.7243
+  P@10   0.1000   R@10   1.0000   nDCG@10   0.7243
+top-1 category match: 1.0000
+latency ms        : mean 72.20 p50 11.70 p95 15.82
+----------------------------------------
+index backend     : exact
+recall vs exact@10: 1.0000
+latency ms        : approx 0.26 exact 0.24
+```
+
+Those numbers come from a 60-article *synthetic* corpus whose headlines repeat
+across articles, which is why P@1 is low — they demonstrate the harness, not
+the quality of a real corpus. Add `--report report.json` to persist metrics.
+
+## Configuration
+
+Everything lives in `config/config.py` and every value has an environment
+override; see `.env.example`. The ones worth knowing:
+
+| Variable | Default | Notes |
+|---|---|---|
+| `SBERT_MODEL` | `all-MiniLM-L6-v2` | `all-mpnet-base-v2` is slower but stronger (768-dim); changing it requires rebuilding the index |
+| `INDEX_BACKEND` | `auto` | `auto`, `annoy` or `exact` |
+| `ANNOY_NUM_TREES` | `10` | More trees: better recall, larger index |
+| `DEFAULT_NUM_RESULTS` / `MAX_NUM_RESULTS` | `10` / `50` | Result count clamp |
+| `SNIPPET_CHARS` | `400` | `0` returns the full stored body |
+| `FLASK_DEBUG` | `0` | `1`/`true`/`yes`/`on` enable the debug server |
+| `DATA_DIR` / `MODEL_DIR` | `./data`, `./models` | Keep artefacts outside the repo |
+
+The dimension of a loaded index comes from `metadata.pkl`, so swapping
+`SBERT_MODEL` without rebuilding fails loudly instead of returning nonsense.
+
+## Docker
 
 ```bash
-# Start all services
-docker-compose up -d
-
-# View logs
-docker-compose logs -f search-api
-
-# Stop services
-docker-compose down
+docker compose up --build      # API on http://localhost:5000
 ```
 
-## AWS EC2 Deployment
+`models/` and `data/` are bind-mounted, so build the artefacts on the host
+first (or exec into the container and run the pipeline). The image serves with
+gunicorn and installs ANNOY opportunistically — the build succeeds either way.
 
-### Step 1: Launch EC2 Instance
+For EC2 deployment see [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md).
 
-1. Go to AWS Management Console → EC2
-2. Click "Launch Instance"
-3. **AMI**: Ubuntu Server 22.04 LTS
-4. **Instance Type**: t3.medium or larger (4GB RAM recommended)
-5. **Security Group**: 
-   - Allow SSH (port 22) from your IP
-   - Allow HTTP (port 80) - optional, for load balancer
-   - Allow port 5000 from your IP (or use load balancer)
-
-### Step 2: Connect to Instance
+## Tests
 
 ```bash
-ssh -i your-key.pem ubuntu@your-instance-public-ip
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### Step 3: Install Docker & Docker Compose
+The suite is entirely offline: SBERT is replaced by a deterministic hashing
+encoder and the corpus is a five-article fixture, so nothing downloads a model
+or touches the network. The spaCy lemmatisation tests skip themselves when
+`en_core_web_sm` is not installed.
+
+To smoke test a running server:
 
 ```bash
-# Update system
-sudo apt-get update && sudo apt-get upgrade -y
-
-# Install Docker
-curl -fsSL https://get.docker.com -o get-docker.sh
-sudo sh get-docker.sh
-sudo usermod -aG docker ubuntu
-
-# Install Docker Compose
-sudo curl -L "https://github.com/docker/compose/releases/latest/download/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
-sudo chmod +x /usr/local/bin/docker-compose
-
-# Verify installation
-docker --version
-docker-compose --version
+python scripts/smoke_test_api.py --url http://localhost:5000
 ```
 
-### Step 4: Clone and Deploy Project
+## Known limitations
 
-```bash
-# Clone the repository
-git clone https://github.com/your-username/search-relevancy.git
-cd search-relevancy
-
-# Create directories for models and data
-mkdir -p models data/raw data/processed
-
-# Copy your data to the instance (from your local machine)
-scp -i your-key.pem data/raw/news_articles.csv ubuntu@your-instance:/home/ubuntu/search-relevancy/data/raw/
-
-# Copy pre-generated models (if available)
-scp -i your-key.pem -r models/* ubuntu@your-instance:/home/ubuntu/search-relevancy/models/
-```
-
-### Step 5: Build and Run with Docker Compose
-
-```bash
-# Navigate to project directory
-cd search-relevancy
-
-# Build and start containers
-docker-compose up --build -d
-
-# Check logs
-docker-compose logs -f search-api
-
-# Verify health
-curl http://localhost:5000/health
-```
-
-### Step 6: Using AWS Application Load Balancer (Optional)
-
-For production deployments, use AWS ALB:
-
-1. **Create Target Group**
-   - Port: 5000
-   - Health check path: `/health`
-
-2. **Create Application Load Balancer**
-   - Listen on port 80
-   - Route to target group
-
-3. **Update Security Group**
-   - Allow ALB to access EC2 instance on port 5000
-
-### Step 7: Monitor and Maintain
-
-```bash
-# View running containers
-docker-compose ps
-
-# View detailed logs
-docker-compose logs search-api
-
-# Restart service
-docker-compose restart search-api
-
-# Update container
-docker-compose down
-docker-compose up --build -d
-```
-
-## Performance Optimization
-
-### Configuration Tuning
-
-Edit [config/config.py](config/config.py):
-
-```python
-# ANNOY tuning (more trees = more accurate but slower)
-ANNOY_NUM_TREES = 10  # Increase for better accuracy
-
-# Search results
-DEFAULT_NUM_RESULTS = 10
-MAX_NUM_RESULTS = 50
-
-# Model selection (lighter models for faster inference)
-SBERT_MODEL = "all-MiniLM-L6-v2"  # Fast, 384-dim
-# Alternative: "all-mpnet-base-v2"  # Slower but more accurate, 768-dim
-```
-
-### EC2 Instance Sizing
-
-| Dataset Size | Recommended Instance | RAM | vCPU |
-|---|---|---|---|
-| < 50K articles | t3.medium | 4 GB | 2 |
-| 50K - 500K articles | t3.large | 8 GB | 2 |
-| > 500K articles | t3.xlarge | 16 GB | 4 |
-
-## Troubleshooting
-
-### Model Loading Issues
-
-```bash
-# Download spacy model manually
-python -m spacy download en_core_web_sm
-
-# Verify SBERT model
-python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')"
-```
-
-### Memory Issues on EC2
-
-```bash
-# Check available memory
-free -h
-
-# Monitor Docker usage
-docker stats
-
-# Limit container memory
-docker run -m 2g ...
-```
-
-### Port Already in Use
-
-```bash
-# Check processes on port 5000
-lsof -i :5000
-
-# Kill process
-kill -9 <PID>
-```
-
-## API Usage Examples
-
-### Python Client
-
-```python
-import requests
-
-API_URL = "http://localhost:5000"
-
-# Single search
-response = requests.post(f"{API_URL}/search", json={
-    "query": "artificial intelligence",
-    "num_results": 5
-})
-results = response.json()
-print(f"Found {results['num_results']} relevant articles")
-
-for article in results['results']:
-    print(f"- {article['title']} (relevance: {article['relevance_score']:.2%})")
-
-# Get service info
-info = requests.get(f"{API_URL}/info").json()
-print(f"Total articles: {info['num_articles']}")
-```
-
-### cURL
-
-```bash
-# Search
-curl -X POST http://localhost:5000/search \
-  -H "Content-Type: application/json" \
-  -d '{"query": "climate change", "num_results": 10}'
-
-# Health check
-curl http://localhost:5000/health
-
-# Service info
-curl http://localhost:5000/info
-```
-
-## Contributing
-
-1. Create a feature branch
-2. Make changes
-3. Test locally with Docker Compose
-4. Submit pull request
+- Retrieval is single-vector dense only. There is no lexical (BM25) leg and no
+  hybrid fusion, so exact rare terms — product codes, surnames — can be missed.
+- The index is rebuilt from scratch; there is no incremental add or delete.
+- The evaluation query set is derived from titles unless labels are supplied.
+  Real relevance judgements would be a considerably stronger signal.
+- The API has no authentication or rate limiting; put it behind a gateway
+  before exposing it publicly.
 
 ## License
 
-MIT License - See LICENSE file for details
-
-## Authors
-
-Search Relevancy Team
-
-## Support
-
-For issues and questions:
-- GitHub Issues
-- Email: support@searchrelevancy.com
-
----
-
-**Note**: This is a production-ready system. Always test thoroughly before deploying to production environments.
+MIT — see [LICENSE](LICENSE).

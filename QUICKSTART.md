@@ -1,308 +1,122 @@
-# Quick Start Guide
+# Quick start
 
-Get the Search Relevancy application running in minutes!
+From a clean checkout to a working search API. Roughly five minutes, most of
+it spent downloading the SBERT model the first time.
 
-## Prerequisites
-
-- Python 3.10+ or Docker
-- 4GB+ RAM recommended
-
----
-
-## Option 1: Local Development (Python)
-
-### 1. Setup Environment
+## 1. Install
 
 ```bash
-cd "c:\Users\sarth\OneDrive\Desktop\Projects\Search relevancy"
-
-# Create virtual environment
 python -m venv venv
+source venv/bin/activate          # Windows: venv\Scripts\activate
 
-# Activate (Windows)
-venv\Scripts\activate
-# Or (Mac/Linux)
-source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 python -m spacy download en_core_web_sm
 ```
 
-### 2. Generate Sample Data
+Optional, for the approximate index backend (needs a C++ toolchain):
 
 ```bash
-python generate_sample_data.py
-# Creates sample news articles in data/raw/news_articles.csv
+pip install -r requirements-annoy.txt
 ```
 
-### 3. Run Full Pipeline
+Without it the project uses the built-in exact numpy index — everything works,
+results are exact, and it is fast enough well past 100k articles.
 
-**Windows:**
+## 2. Build an index
+
 ```bash
-run_pipeline.bat
+./run_pipeline.sh                 # Windows: run_pipeline.bat
 ```
 
-**Mac/Linux:**
+That generates a synthetic corpus, preprocesses it, embeds it, builds the
+index and prints a relevancy report. To use your own data instead, put a CSV
+with `title` and `text` columns at `data/raw/news_articles.csv` and run:
+
 ```bash
-bash run_pipeline.sh
+SKIP_SAMPLE=1 ./run_pipeline.sh   # Windows: set SKIP_SAMPLE=1 && run_pipeline.bat
 ```
 
-Or run steps individually:
+Artefacts land in `models/`:
 
-```bash
-# Preprocess data
-python src/data_preprocessing.py
-
-# Generate embeddings
-python src/sbert_embeddings.py
-
-# Build index
-python src/build_annoy_index.py
-
-# Start API
-python src/app.py
+```
+models/embeddings.npy          the encoded corpus
+models/metadata.pkl            index position -> article
+models/articles_index.npz      exact backend  (or .annoy for ANNOY)
 ```
 
-### 4. Test the API
+## 3. Search
 
-In a new terminal:
+Terminal:
+
 ```bash
-python test_api.py
+python -m src.search_cli "ocean temperatures and glaciers" -n 5
 ```
 
-Or manually:
+API:
+
 ```bash
-# Health check
+python -m src.app
+```
+
+```bash
 curl http://localhost:5000/health
 
-# Search
 curl -X POST http://localhost:5000/search \
   -H "Content-Type: application/json" \
-  -d "{\"query\": \"climate change\", \"num_results\": 5}"
+  -d '{"query": "climate change", "num_results": 5}'
 ```
 
----
-
-## Option 2: Docker (Recommended)
-
-### 1. Prerequisites
-
-- Docker installed
-- Docker Compose installed
-
-### 2. Generate Sample Data
-
-```bash
-cd "c:\Users\sarth\OneDrive\Desktop\Projects\Search relevancy"
-python generate_sample_data.py
-```
-
-### 3. Run with Docker Compose
-
-```bash
-# Build and start
-docker-compose up --build
-
-# In another terminal, run pipeline or test
-python test_api.py
-```
-
-Access the API at `http://localhost:5000`
-
-### 4. Stop
-
-```bash
-docker-compose down
-```
-
----
-
-## API Examples
-
-### Python
+Python client:
 
 ```python
 import requests
 
-# Search
-response = requests.post("http://localhost:5000/search", json={
-    "query": "climate change",
-    "num_results": 5
-})
-
-results = response.json()
-for article in results['results']:
-    print(f"✓ {article['title']}")
-    print(f"  Relevance: {article['relevance_score']:.1%}\n")
+response = requests.post(
+    "http://localhost:5000/search",
+    json={"query": "artificial intelligence", "num_results": 5},
+)
+for hit in response.json()["results"]:
+    print(f"{hit['relevance_score']:+.4f}  {hit['title']}")
 ```
 
-### cURL
+## 4. Check the quality
 
 ```bash
-# Single search
-curl -X POST http://localhost:5000/search \
-  -H "Content-Type: application/json" \
-  -d '{"query":"artificial intelligence","num_results":10}'
-
-# Batch search
-curl -X POST http://localhost:5000/search/batch \
-  -H "Content-Type: application/json" \
-  -d '{"queries":["AI","climate","tech"],"num_results":5}'
-
-# Get info
-curl http://localhost:5000/info
-
-# Health check
-curl http://localhost:5000/health
+python -m src.evaluate --sample-size 200 --k 1 5 10
 ```
 
----
+Reports Precision/Recall/nDCG@k, MRR, query latency and — when ANNOY is in use
+— how much recall the approximation costs versus exact search.
 
-## API Endpoints
+## Docker
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/health` | GET | Health check |
-| `/info` | GET | Service information |
-| `/search` | POST | Search articles |
-| `/search/batch` | POST | Batch search multiple queries |
-
-### Search Request Format
-
-```json
-{
-  "query": "your search term",
-  "num_results": 10
-}
-```
-
-### Search Response Format
-
-```json
-{
-  "query": "your search term",
-  "num_results": 2,
-  "results": [
-    {
-      "article_id": "article_00001",
-      "title": "Article Title",
-      "category": "Category",
-      "subcategory": "Subcategory",
-      "source": "Source",
-      "published_date": "2023-01-15",
-      "text": "Article content...",
-      "relevance_score": 0.95
-    }
-  ]
-}
-```
-
----
-
-## Project Structure
-
-```
-Search relevancy/
-├── src/                     # Source code
-│   ├── app.py              # Flask API
-│   ├── data_preprocessing.py
-│   ├── sbert_embeddings.py
-│   └── build_annoy_index.py
-├── config/
-│   └── config.py           # Configuration
-├── data/
-│   ├── raw/                # Raw data
-│   └── processed/          # Processed data
-├── models/                 # Models and indices
-├── Dockerfile              # Docker image
-├── docker-compose.yml      # Docker Compose config
-├── requirements.txt        # Python dependencies
-├── test_api.py             # API tests
-└── README.md               # Full documentation
-```
-
----
-
-## Configuration
-
-Edit `config/config.py` to customize:
-
-```python
-# SBERT model (trade-off between speed and accuracy)
-SBERT_MODEL = "all-MiniLM-L6-v2"  # Fast, 384-dim
-# or "all-mpnet-base-v2"  # More accurate, 768-dim
-
-# ANNOY index accuracy (more trees = more accurate)
-ANNOY_NUM_TREES = 10
-
-# Search defaults
-DEFAULT_NUM_RESULTS = 10
-MAX_NUM_RESULTS = 50
-```
-
----
-
-## Troubleshooting
-
-### Import errors
 ```bash
-pip install -r requirements.txt
-python -m spacy download en_core_web_sm
+docker compose up --build
 ```
 
-### Port already in use
+`models/` and `data/` are bind-mounted, so build the artefacts on the host
+first (step 2).
+
+## Tests
+
 ```bash
-# Windows
-netstat -ano | findstr :5000
-taskkill /PID <PID> /F
-
-# Mac/Linux
-lsof -i :5000
-kill -9 <PID>
+pip install -r requirements-dev.txt
+pytest
 ```
 
-### Out of memory
-```bash
-# Reduce ANNOY trees or use lighter SBERT model
-# See config.py
-```
+Offline: no model download, no network, no server.
 
-### Docker issues
-```bash
-# Rebuild
-docker-compose down
-docker-compose up --build
+## If something goes wrong
 
-# Check logs
-docker-compose logs search-api
-```
+| Symptom | Fix |
+|---|---|
+| `spaCy model 'en_core_web_sm' is not installed` | `python -m spacy download en_core_web_sm` |
+| `no index found (looked for: ...)` | Run the pipeline (step 2) |
+| `metadata not found` | Run `python -m src.sbert_embeddings` |
+| `/health` returns 503 | Read `details` in the response; the artefacts are usually missing or the volume is not mounted |
+| `pip install annoy` fails on Windows | Skip it — the exact backend is the default fallback |
+| Port 5000 already in use | `FLASK_PORT=5001 python -m src.app` |
+| Model download blocked | Pre-download on a connected machine and copy `~/.cache/huggingface` across |
 
----
-
-## Next Steps
-
-1. **Customize with your data**: Replace `news_articles.csv` in `data/raw/`
-2. **Deploy to AWS**: See [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md)
-3. **Integrate with frontend**: API ready at `http://localhost:5000`
-4. **Production deployment**: Use Docker Compose on cloud
-
----
-
-## Performance Tips
-
-- **Faster inference**: Use lighter SBERT model
-  - `all-MiniLM-L6-v2` (384-dim, fastest)
-  - `all-mpnet-base-v2` (768-dim, more accurate)
-
-- **Faster search**: Reduce ANNOY trees (less accurate)
-  - `ANNOY_NUM_TREES = 5` (faster)
-  - `ANNOY_NUM_TREES = 20` (more accurate)
-
-- **Better results**: Add more training data
-
-- **Scaling**: Use Docker Compose with load balancer
-
----
-
-For detailed documentation, see [README.md](README.md) and [AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md)
+More detail in [README.md](README.md); EC2 deployment in
+[AWS_DEPLOYMENT.md](AWS_DEPLOYMENT.md).

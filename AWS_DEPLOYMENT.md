@@ -431,8 +431,8 @@ sudo ufw allow 5000/tcp
 # Check instance type
 # If using t3.small/medium, consider upgrading to t3.large
 
-# Optimize ANNOY parameters
-# Reduce num_trees in config.py
+# Tune the index: lower ANNOY_NUM_TREES trades recall for speed,
+# and INDEX_BACKEND=exact is often faster below ~50k articles.
 # Increase Docker memory allocation
 
 # Use CloudWatch to identify bottlenecks
@@ -441,11 +441,11 @@ sudo ufw allow 5000/tcp
 ### Data synchronization issues
 
 ```bash
-# Verify ANNOY index integrity
-python -c "from annoy import AnnoyIndex; idx = AnnoyIndex(384, 'angular'); idx.load('models/articles_index.annoy'); print(f'Index loaded: {idx.get_n_items()} items')"
+# Verify index integrity (works for both backends)
+python -c "from src.search_engine import load_search_engine; e = load_search_engine('models/articles_index.annoy', 'models/metadata.pkl'); print(e.info())"
 
 # Rebuild if corrupted
-python src/build_annoy_index.py
+python -m src.build_annoy_index
 docker-compose restart search-api
 ```
 
