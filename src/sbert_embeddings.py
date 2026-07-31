@@ -1,52 +1,106 @@
-import pandas as pd
-import numpy as np
-import logging
-from pathlib import Path
-import pickle
-from sentence_transformers import SentenceTransformer
-from typing import Tuple, List
+"""Generate SBERT embeddings and the metadata sidecar for processed articles."""
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+from __future__ import annotations
+
+import argparse
+import logging
+import pickle
+import sys
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+# Allow both "python -m src.sbert_embeddings" and direct script execution.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 logger = logging.getLogger(__name__)
+
+#: Article body characters retained in the metadata sidecar. Keeping whole
+#: bodies makes the pickle as large as the corpus for no retrieval benefit.
+METADATA_TEXT_CHARS = 1000
 
 
 class SBERTEmbedder:
-    """Generate SBERT embeddings for news articles."""
-    
+    """Generate SBERT embeddings for a collection of texts."""
+
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        """
-        Initialize SBERT embedder.
-        
-        Args:
-            model_name: Name of the pre-trained SBERT model to use
-        """
-        logger.info(f"Loading SBERT model: {model_name}")
+        from sentence_transformers import SentenceTransformer
+
+        logger.info("loading SBERT model: %s", model_name)
+        self.model_name = model_name
         self.model = SentenceTransformer(model_name)
-        self.embedding_dim = self.model.get_sentence_embedding_dimension()
-        logger.info(f"Model loaded. Embedding dimension: {self.embedding_dim}")
-    
-    def encode(self, texts: List[str], batch_size: int = 32, show_progress: bool = True) -> np.ndarray:
-        """
-        Encode texts to embeddings.
-        
-        Args:
-            texts: List of texts to encode
-            batch_size: Batch size for processing
-            show_progress: Whether to show progress bar
-            
-        Returns:
-            Numpy array of embeddings
-        """
-        logger.info(f"Encoding {len(texts)} texts...")
+        self.embedding_dim = int(self.model.get_sentence_embedding_dimension())
+        logger.info("model loaded, embedding dimension: %d", self.embedding_dim)
+
+    def encode(
+        self,
+        texts: List[str],
+        batch_size: int = 32,
+        show_progress: bool = True,
+    ) -> np.ndarray:
+        """Encode ``texts`` into a ``(len(texts), dim)`` float32 array."""
+        logger.info("encoding %d texts", len(texts))
         embeddings = self.model.encode(
-            texts,
+            list(texts),
             batch_size=batch_size,
             show_progress_bar=show_progress,
-            convert_to_numpy=True
+            convert_to_numpy=True,
         )
-        logger.info(f"Encoding complete. Shape: {embeddings.shape}")
+        embeddings = np.asarray(embeddings, dtype=np.float32)
+        logger.info("encoding complete, shape: %s", embeddings.shape)
         return embeddings
+
+
+def _column(df: pd.DataFrame, name: str) -> List[Any]:
+    if name not in df.columns:
+        return []
+    return df[name].where(df[name].notna(), None).tolist()
+
+
+def build_metadata(
+    df: pd.DataFrame,
+    model_name: str,
+    embedding_dim: int,
+    text_chars: int = METADATA_TEXT_CHARS,
+) -> Dict[str, Any]:
+    """Build the metadata sidecar mapping index positions back to articles."""
+    texts = _column(df, "text")
+    if text_chars > 0:
+        texts = [None if text is None else str(text)[:text_chars] for text in texts]
+
+    return {
+        "article_ids": _column(df, "article_id"),
+        "titles": _column(df, "title"),
+        "categories": _column(df, "category"),
+        "subcategories": _column(df, "subcategory"),
+        "sources": _column(df, "source"),
+        "published_dates": _column(df, "published_date"),
+        "texts": texts,
+        "embedding_model": model_name,
+        "embedding_dimension": int(embedding_dim),
+        "num_articles": int(len(df)),
+    }
+
+
+def texts_to_embed(df: pd.DataFrame) -> List[str]:
+    """Pick what to embed: the processed text when it is populated."""
+    if "processed_text" in df.columns:
+        column = df["processed_text"].fillna("").astype(str)
+        if column.str.len().gt(0).any():
+            return column.tolist()
+        logger.warning("processed_text column is empty; falling back to title+text")
+
+    if "title" not in df.columns and "text" not in df.columns:
+        raise ValueError("input data has neither 'processed_text' nor 'title'/'text'")
+
+    empty = pd.Series([""] * len(df), index=df.index)
+    title = df["title"].fillna("").astype(str) if "title" in df.columns else empty
+    body = df["text"].fillna("").astype(str) if "text" in df.columns else empty
+    return (title + " " + body).str.strip().tolist()
 
 
 def generate_embeddings(
@@ -54,78 +108,89 @@ def generate_embeddings(
     embeddings_output_path: str,
     metadata_output_path: str,
     model_name: str = "all-MiniLM-L6-v2",
-    batch_size: int = 32
-) -> Tuple[np.ndarray, dict]:
-    """
-    Generate SBERT embeddings for processed articles.
-    
+    batch_size: int = 32,
+    embedder: Optional[SBERTEmbedder] = None,
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """Embed a processed CSV and persist the vectors plus metadata.
+
     Args:
-        input_path: Path to processed CSV file
-        embeddings_output_path: Path to save embeddings
-        metadata_output_path: Path to save metadata
-        model_name: SBERT model name
-        batch_size: Batch size for encoding
-        
+        input_path: Processed CSV produced by ``src.data_preprocessing``.
+        embeddings_output_path: Where to write the ``.npy`` matrix.
+        metadata_output_path: Where to write the ``.pkl`` metadata sidecar.
+        model_name: SBERT model to load when ``embedder`` is not supplied.
+        batch_size: Encoder batch size.
+        embedder: Pre-built embedder (used by tests).
+
     Returns:
-        Tuple of (embeddings array, metadata dict)
+        ``(embeddings, metadata)``.
     """
-    # Load processed data
-    logger.info(f"Loading processed data from {input_path}")
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise FileNotFoundError(
+            f"processed data not found at {input_path}. "
+            f"Run 'python -m src.data_preprocessing' first."
+        )
+
+    logger.info("loading processed data from %s", input_path)
     df = pd.read_csv(input_path)
-    logger.info(f"Loaded {len(df)} articles")
-    
-    # Initialize embedder
-    embedder = SBERTEmbedder(model_name=model_name)
-    
-    # Extract texts for embedding
-    # Use processed_text if available, otherwise use title + text
-    if 'processed_text' in df.columns:
-        texts = df['processed_text'].tolist()
-    else:
-        texts = (df['title'].fillna('') + ' ' + df['text'].fillna('')).tolist()
-    
-    # Generate embeddings
-    embeddings = embedder.encode(texts, batch_size=batch_size)
-    
-    # Prepare metadata
-    metadata = {
-        'article_ids': df['article_id'].tolist(),
-        'titles': df['title'].tolist(),
-        'categories': df['category'].tolist() if 'category' in df.columns else [],
-        'subcategories': df['subcategory'].tolist() if 'subcategory' in df.columns else [],
-        'sources': df['source'].tolist() if 'source' in df.columns else [],
-        'published_dates': df['published_date'].tolist() if 'published_date' in df.columns else [],
-        'texts': df['text'].tolist() if 'text' in df.columns else [],
-        'embedding_model': model_name,
-        'embedding_dimension': embedder.embedding_dim,
-        'num_articles': len(df)
-    }
-    
-    # Save embeddings
-    Path(embeddings_output_path).parent.mkdir(parents=True, exist_ok=True)
+    if df.empty:
+        raise ValueError(f"{input_path} contains no rows")
+    logger.info("loaded %d articles", len(df))
+
+    embedder = embedder or SBERTEmbedder(model_name=model_name)
+    embeddings = embedder.encode(texts_to_embed(df), batch_size=batch_size)
+
+    metadata = build_metadata(
+        df, model_name=embedder.model_name, embedding_dim=embedder.embedding_dim
+    )
+
+    embeddings_output_path = Path(embeddings_output_path)
+    embeddings_output_path.parent.mkdir(parents=True, exist_ok=True)
     np.save(embeddings_output_path, embeddings)
-    logger.info(f"Saved embeddings to {embeddings_output_path}")
-    
-    # Save metadata
-    Path(metadata_output_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(metadata_output_path, 'wb') as f:
-        pickle.dump(metadata, f)
-    logger.info(f"Saved metadata to {metadata_output_path}")
-    
+    logger.info("saved embeddings to %s", embeddings_output_path)
+
+    metadata_output_path = Path(metadata_output_path)
+    metadata_output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(metadata_output_path, "wb") as handle:
+        pickle.dump(metadata, handle)
+    logger.info("saved metadata to %s", metadata_output_path)
+
     return embeddings, metadata
 
 
-if __name__ == "__main__":
-    from config.config import PROCESSED_DATA_PATH, EMBEDDINGS_PATH, METADATA_PATH, SBERT_MODEL
-    
-    # Check if processed data exists
-    if not Path(PROCESSED_DATA_PATH).exists():
-        logger.warning(f"Processed data not found at {PROCESSED_DATA_PATH}")
-        logger.info("Please run data_preprocessing.py first")
-    else:
+def main(argv: Optional[List[str]] = None) -> int:
+    from config.config import (
+        EMBEDDING_BATCH_SIZE,
+        EMBEDDINGS_PATH,
+        METADATA_PATH,
+        PROCESSED_DATA_PATH,
+        SBERT_MODEL,
+    )
+
+    parser = argparse.ArgumentParser(description="Generate SBERT embeddings.")
+    parser.add_argument("--input", default=str(PROCESSED_DATA_PATH))
+    parser.add_argument("--embeddings-output", default=str(EMBEDDINGS_PATH))
+    parser.add_argument("--metadata-output", default=str(METADATA_PATH))
+    parser.add_argument("--model", default=SBERT_MODEL)
+    parser.add_argument("--batch-size", type=int, default=EMBEDDING_BATCH_SIZE)
+    args = parser.parse_args(argv)
+
+    try:
         generate_embeddings(
-            str(PROCESSED_DATA_PATH),
-            str(EMBEDDINGS_PATH),
-            str(METADATA_PATH),
-            model_name=SBERT_MODEL
+            args.input,
+            args.embeddings_output,
+            args.metadata_output,
+            model_name=args.model,
+            batch_size=args.batch_size,
         )
+    except (FileNotFoundError, ValueError) as exc:
+        logger.error("%s", exc)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    )
+    raise SystemExit(main())

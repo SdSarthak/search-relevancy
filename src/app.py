@@ -1,276 +1,238 @@
-import pickle
-import numpy as np
-import logging
-from pathlib import Path
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-from typing import Dict, List, Any
-from sentence_transformers import SentenceTransformer
-from annoy import AnnoyIndex
+"""Flask REST API exposing the semantic article search.
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+Create the WSGI application with :func:`create_app` so it works both with the
+built-in dev server (``python -m src.app``) and a production server, e.g.::
+
+    gunicorn -w 2 -b 0.0.0.0:5000 "src.app:create_app()"
+"""
+
+from __future__ import annotations
+
+import logging
+import sys
+from pathlib import Path
+from typing import Any, Optional
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+
+# Allow both "python -m src.app" and direct script execution.
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+from config.config import (  # noqa: E402
+    ANNOY_METRIC,
+    DEFAULT_NUM_RESULTS,
+    FLASK_DEBUG,
+    FLASK_HOST,
+    FLASK_PORT,
+    INDEX_BACKEND,
+    INDEX_PATH,
+    MAX_NUM_RESULTS,
+    METADATA_PATH,
+    SBERT_MODEL,
+    SNIPPET_CHARS,
+)
+from src.search_engine import SearchEngine, load_search_engine  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
-# Import configuration
-import sys
-sys.path.insert(0, str(Path(__file__).parent.parent))
-from config.config import (
-    SBERT_MODEL, EMBEDDING_DIMENSION, ANNOY_INDEX_PATH, METADATA_PATH,
-    DEFAULT_NUM_RESULTS, MAX_NUM_RESULTS, FLASK_HOST, FLASK_PORT, FLASK_DEBUG
-)
-
-# Initialize Flask app
-app = Flask(__name__)
-CORS(app)
-
-# Global variables for model and index
-sbert_model = None
-annoy_index = None
-metadata = None
+MIN_QUERY_LENGTH = 2
+MAX_QUERY_LENGTH = 512
+MAX_BATCH_QUERIES = 25
 
 
-def initialize_models():
-    """Load SBERT model, ANNOY index, and metadata."""
-    global sbert_model, annoy_index, metadata
-    
-    logger.info("Initializing models...")
-    
-    # Load SBERT model
-    try:
-        logger.info(f"Loading SBERT model: {SBERT_MODEL}")
-        sbert_model = SentenceTransformer(SBERT_MODEL)
-        logger.info("SBERT model loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load SBERT model: {str(e)}")
-        raise
-    
-    # Load metadata
-    try:
-        logger.info(f"Loading metadata from {METADATA_PATH}")
-        with open(METADATA_PATH, 'rb') as f:
-            metadata = pickle.load(f)
-        logger.info(f"Metadata loaded: {metadata['num_articles']} articles")
-    except Exception as e:
-        logger.error(f"Failed to load metadata: {str(e)}")
-        raise
-    
-    # Load ANNOY index
-    try:
-        logger.info(f"Loading ANNOY index from {ANNOY_INDEX_PATH}")
-        annoy_index = AnnoyIndex(EMBEDDING_DIMENSION, metric='angular')
-        annoy_index.load(str(ANNOY_INDEX_PATH))
-        logger.info("ANNOY index loaded successfully")
-    except Exception as e:
-        logger.error(f"Failed to load ANNOY index: {str(e)}")
-        raise
-    
-    logger.info("All models initialized successfully")
-
-
-def encode_query(query: str) -> np.ndarray:
-    """
-    Encode query string to embedding using SBERT.
-    
-    Args:
-        query: Query text
-        
-    Returns:
-        Embedding vector
-    """
-    embedding = sbert_model.encode(query, convert_to_numpy=True)
-    return embedding
-
-
-def search_articles(query: str, num_results: int = DEFAULT_NUM_RESULTS) -> Dict[str, Any]:
-    """
-    Search for relevant articles using query.
-    
-    Args:
-        query: Search query
-        num_results: Number of results to return
-        
-    Returns:
-        Dictionary containing search results
-    """
-    # Validate num_results
-    num_results = max(1, min(num_results, MAX_NUM_RESULTS))
-    
-    # Encode query
-    logger.info(f"Encoding query: '{query}'")
-    query_embedding = encode_query(query)
-    
-    # Search in ANNOY index
-    logger.info(f"Searching for {num_results} nearest neighbors...")
-    article_indices = annoy_index.get_nns_by_vector(
-        query_embedding.tolist(),
-        num_results,
-        include_distances=True
+def build_default_engine() -> SearchEngine:
+    """Load the search engine from the configured artefact paths."""
+    return load_search_engine(
+        index_path=INDEX_PATH,
+        metadata_path=METADATA_PATH,
+        model_name=SBERT_MODEL,
+        backend=INDEX_BACKEND,
+        metric=ANNOY_METRIC,
+        default_num_results=DEFAULT_NUM_RESULTS,
+        max_num_results=MAX_NUM_RESULTS,
+        snippet_chars=SNIPPET_CHARS,
     )
-    
-    # Build results
-    results = []
-    for idx, distance in zip(article_indices[0], article_indices[1]):
-        # Convert distance to similarity (0-1 range)
-        # For angular distance, similarity = 1 - distance/pi
-        similarity = 1 - (distance / np.pi)
-        
-        result = {
-            'article_id': metadata['article_ids'][idx],
-            'title': metadata['titles'][idx],
-            'category': metadata['categories'][idx] if metadata['categories'] else None,
-            'subcategory': metadata['subcategories'][idx] if metadata['subcategories'] else None,
-            'source': metadata['sources'][idx] if metadata['sources'] else None,
-            'published_date': metadata['published_dates'][idx] if metadata['published_dates'] else None,
-            'text': metadata['texts'][idx] if metadata['texts'] else None,
-            'relevance_score': float(similarity)
-        }
-        results.append(result)
-    
-    return {
-        'query': query,
-        'num_results': len(results),
-        'results': results
-    }
 
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Health check endpoint."""
-    return jsonify({
-        'status': 'healthy',
-        'service': 'Search Relevancy API',
-        'num_articles': metadata['num_articles'] if metadata else 0
-    }), 200
+def _validate_query(raw: Any) -> str:
+    if not isinstance(raw, str):
+        raise ValueError("query must be a string")
+    query = raw.strip()
+    if len(query) < MIN_QUERY_LENGTH:
+        raise ValueError(
+            f"query must be at least {MIN_QUERY_LENGTH} characters long"
+        )
+    if len(query) > MAX_QUERY_LENGTH:
+        raise ValueError(f"query must be at most {MAX_QUERY_LENGTH} characters long")
+    return query
 
 
-@app.route('/search', methods=['POST'])
-def search():
+def create_app(engine: Optional[SearchEngine] = None, eager: bool = True) -> Flask:
+    """Build the Flask application.
+
+    Args:
+        engine: Pre-built search engine. When omitted one is loaded from disk.
+        eager: Load the engine at start-up. Set ``False`` to defer loading to
+            the first request (handy when the container starts before the
+            model volume is mounted).
     """
-    Search endpoint.
-    
-    Request body:
-        {
-            "query": "search query string",
-            "num_results": 10 (optional)
-        }
-    
-    Response:
-        {
-            "query": "search query string",
-            "num_results": 10,
-            "results": [
+    app = Flask(__name__)
+    CORS(app)
+    app.config["ENGINE"] = engine
+    app.config["ENGINE_ERROR"] = None
+
+    def get_engine() -> Optional[SearchEngine]:
+        if app.config["ENGINE"] is None and app.config["ENGINE_ERROR"] is None:
+            try:
+                app.config["ENGINE"] = build_default_engine()
+            except Exception as exc:  # surfaced through /health
+                app.config["ENGINE_ERROR"] = str(exc)
+                logger.error("failed to load search engine: %s", exc)
+        return app.config["ENGINE"]
+
+    def require_engine():
+        engine = get_engine()
+        if engine is None:
+            detail = app.config["ENGINE_ERROR"] or "search engine not initialised"
+            return None, (
+                jsonify({"error": "Service unavailable", "details": detail}),
+                503,
+            )
+        return engine, None
+
+    if eager and engine is None:
+        get_engine()
+
+    @app.get("/health")
+    def health_check():
+        engine = get_engine()
+        if engine is None:
+            return (
+                jsonify(
+                    {
+                        "status": "unhealthy",
+                        "service": "Search Relevancy API",
+                        "details": app.config["ENGINE_ERROR"]
+                        or "search engine not initialised",
+                    }
+                ),
+                503,
+            )
+        return (
+            jsonify(
                 {
-                    "article_id": "...",
-                    "title": "...",
-                    "category": "...",
-                    "subcategory": "...",
-                    "source": "...",
-                    "published_date": "...",
-                    "text": "...",
-                    "relevance_score": 0.95
+                    "status": "healthy",
+                    "service": "Search Relevancy API",
+                    "num_articles": engine.num_articles,
                 }
-            ]
-        }
-    """
-    try:
-        data = request.get_json()
-        
-        if not data or 'query' not in data:
-            return jsonify({'error': 'Missing required field: query'}), 400
-        
-        query = data['query'].strip()
-        if not query or len(query) < 2:
-            return jsonify({'error': 'Query must be at least 2 characters long'}), 400
-        
-        num_results = data.get('num_results', DEFAULT_NUM_RESULTS)
-        
-        # Perform search
-        logger.info(f"Processing search request: query='{query}', num_results={num_results}")
-        results = search_articles(query, num_results)
-        
+            ),
+            200,
+        )
+
+    @app.get("/info")
+    def info():
+        engine, failure = require_engine()
+        if failure:
+            return failure
+        payload = {"service": "Search Relevancy API"}
+        payload.update(engine.info())
+        return jsonify(payload), 200
+
+    @app.post("/search")
+    def search():
+        """Search endpoint.
+
+        Body: ``{"query": "climate change", "num_results": 10}``
+        """
+        engine, failure = require_engine()
+        if failure:
+            return failure
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or "query" not in data:
+            return jsonify({"error": "Missing required field: query"}), 400
+
+        try:
+            query = _validate_query(data["query"])
+            num_results = engine.clamp_num_results(
+                data.get("num_results", DEFAULT_NUM_RESULTS)
+            )
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            results = engine.search(query, num_results)
+        except Exception as exc:
+            logger.exception("search failed for query %r", query)
+            return jsonify({"error": "Internal server error", "details": str(exc)}), 500
         return jsonify(results), 200
-    
-    except Exception as e:
-        logger.error(f"Search error: {str(e)}")
-        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
+
+    @app.post("/search/batch")
+    def batch_search():
+        """Batch endpoint.
+
+        Body: ``{"queries": ["a", "b"], "num_results": 5}``
+        """
+        engine, failure = require_engine()
+        if failure:
+            return failure
+
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict) or "queries" not in data:
+            return jsonify({"error": "Missing required field: queries"}), 400
+
+        queries = data["queries"]
+        if not isinstance(queries, list) or not queries:
+            return jsonify({"error": "queries must be a non-empty list"}), 400
+        if len(queries) > MAX_BATCH_QUERIES:
+            return (
+                jsonify({"error": f"at most {MAX_BATCH_QUERIES} queries per batch"}),
+                400,
+            )
+
+        try:
+            num_results = engine.clamp_num_results(
+                data.get("num_results", DEFAULT_NUM_RESULTS)
+            )
+            validated = [_validate_query(query) for query in queries]
+        except ValueError as exc:
+            return jsonify({"error": str(exc)}), 400
+
+        try:
+            batch_results = engine.batch_search(validated, num_results)
+        except Exception as exc:
+            logger.exception("batch search failed")
+            return jsonify({"error": "Internal server error", "details": str(exc)}), 500
+        return jsonify({"batch_results": batch_results}), 200
+
+    @app.errorhandler(404)
+    def not_found(_error):
+        return jsonify({"error": "Endpoint not found"}), 404
+
+    @app.errorhandler(405)
+    def method_not_allowed(_error):
+        return jsonify({"error": "Method not allowed"}), 405
+
+    @app.errorhandler(500)
+    def internal_error(error):
+        logger.error("internal server error: %s", error)
+        return jsonify({"error": "Internal server error"}), 500
+
+    return app
 
 
-@app.route('/search/batch', methods=['POST'])
-def batch_search():
-    """
-    Batch search endpoint for multiple queries.
-    
-    Request body:
-        {
-            "queries": ["query1", "query2"],
-            "num_results": 10 (optional)
-        }
-    """
-    try:
-        data = request.get_json()
-        
-        if not data or 'queries' not in data:
-            return jsonify({'error': 'Missing required field: queries'}), 400
-        
-        queries = data['queries']
-        if not isinstance(queries, list) or len(queries) == 0:
-            return jsonify({'error': 'queries must be a non-empty list'}), 400
-        
-        num_results = data.get('num_results', DEFAULT_NUM_RESULTS)
-        
-        # Process queries
-        batch_results = []
-        for query in queries:
-            query = query.strip()
-            if query and len(query) >= 2:
-                results = search_articles(query, num_results)
-                batch_results.append(results)
-        
-        return jsonify({'batch_results': batch_results}), 200
-    
-    except Exception as e:
-        logger.error(f"Batch search error: {str(e)}")
-        return jsonify({'error': 'Internal server error', 'details': str(e)}), 500
-
-
-@app.route('/info', methods=['GET'])
-def info():
-    """Get information about the search service."""
-    if not metadata:
-        return jsonify({'error': 'Service not initialized'}), 503
-    
-    return jsonify({
-        'service': 'Search Relevancy API',
-        'num_articles': metadata['num_articles'],
-        'embedding_model': metadata['embedding_model'],
-        'embedding_dimension': metadata['embedding_dimension'],
-        'default_results': DEFAULT_NUM_RESULTS,
-        'max_results': MAX_NUM_RESULTS
-    }), 200
-
-
-@app.errorhandler(404)
-def not_found(error):
-    """Handle 404 errors."""
-    return jsonify({'error': 'Endpoint not found'}), 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    """Handle 500 errors."""
-    logger.error(f"Internal server error: {str(error)}")
-    return jsonify({'error': 'Internal server error'}), 500
-
-
-if __name__ == '__main__':
-    # Initialize models before starting server
-    initialize_models()
-    
-    # Start Flask app
-    logger.info(f"Starting Flask server on {FLASK_HOST}:{FLASK_PORT}")
-    app.run(
-        host=FLASK_HOST,
-        port=FLASK_PORT,
-        debug=FLASK_DEBUG
+def main() -> int:
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
     )
+    app = create_app()
+    logger.info("starting Flask server on %s:%s", FLASK_HOST, FLASK_PORT)
+    app.run(host=FLASK_HOST, port=FLASK_PORT, debug=FLASK_DEBUG)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
